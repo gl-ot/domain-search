@@ -7,35 +7,48 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
-	"os"
 	"strings"
+	"sync"
+)
+
+const (
+	routineNum = 4
 )
 
 func main() {
 	domain := flag.String("domain", "", "your desired domain")
 	enrichingWordsPath := flag.String("words", "words.txt", "path to file with your enriching words")
-	resultPath := flag.String("result", "available.txt", "path to result file with available domains")
 	flag.Parse()
 	if *domain == "" {
 		log.Fatalf("Please specify your domain")
 	}
 
-	_ = os.Remove(*resultPath)
-	resultFile, err := os.OpenFile(*resultPath, os.O_WRONLY|os.O_CREATE, 0755)
-	check(err)
-	write := func(word string) {
-		resultFile.Write([]byte(word))
-		resultFile.WriteString("\n")
+	availableDomains := make(chan string)
+	wg := sync.WaitGroup{}
+	semaphore := make(chan struct{}, routineNum)
+	for _, w := range readWords(*enrichingWordsPath) {
+		wg.Add(1)
+		cleanedWord := clean(w)
+		go func() {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			for _, d := range computeDomains(*domain, cleanedWord) {
+				body := getBody(d)
+				if isAvailable(body) {
+					availableDomains <- d
+				}
+			}
+			<-semaphore
+		}()
 	}
 
-	for _, rWord := range readWords(*enrichingWordsPath) {
-		cleaned := clean(rWord)
-		for _, domain := range domainNames(*domain, cleaned) {
-			body := getBody(domain)
-			if isAvailable(body) {
-				write(domain)
-			}
-		}
+	go func() {
+		wg.Wait()
+		close(availableDomains)
+	}()
+
+	for d := range availableDomains {
+		fmt.Println(d)
 	}
 }
 
@@ -45,7 +58,7 @@ func clean(word string) string {
 	return word
 }
 
-func domainNames(domain, word string) []string {
+func computeDomains(domain, word string) []string {
 	if word == "" {
 		return []string{}
 	}
@@ -60,10 +73,13 @@ func readWords(path string) []string {
 }
 
 func getBody(word string) []byte {
-	url := fmt.Sprintf("https://uk.godaddy.com/domainfind/v1/search/exact?q=%s&key=ad_dlp_com_ru&pc=&ptl=&solution_set_ids=dpp-us-solution-tier1,dpp-intl-solution-tier4,dpp-intl-solution-tier6&itc=dlp_cheapdomain_com_ru&isc=rudomrub1&req_id=1596292396792", word)
+	url := fmt.Sprintf("https://uk.godaddy.com/domainfind/v1/search/exact?q=%s", word)
 	res, err := http.Get(url)
 	check(err)
 	defer res.Body.Close()
+	if res.StatusCode == http.StatusForbidden {
+		log.Fatal("Godaddy limit request")
+	}
 	body, err := ioutil.ReadAll(res.Body)
 	check(err)
 	return body
